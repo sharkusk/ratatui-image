@@ -22,6 +22,12 @@ use super::{ProtocolTrait, StatefulProtocolTrait};
 /// The character kitty reserves for image placeholders.
 const PLACEHOLDER: char = '\u{10EEEE}';
 
+/// The placement id every virtual placement is created under.
+///
+/// Placement ids are scoped to their image, so one constant serves every image;
+/// see [`transmit_virtual`] for why it is stated rather than left at 0.
+const PLACEMENT: u32 = 1;
+
 #[derive(Default, Clone)]
 struct KittyProtoState {
     transmitted: Arc<AtomicBool>,
@@ -223,6 +229,15 @@ fn zlib(raw: &[u8]) -> Vec<u8> {
 /// `compress` must only be set when the terminal answered the `o=z` capability
 /// probe: a terminal that cannot inflate refuses the transmission outright, and
 /// every placement naming the image then draws nothing at all.
+///
+/// The virtual placement is NAMED (`p=PLACEMENT`) rather than left at the
+/// protocol's default of `p=0`, which means "assign me an internal id". An id can
+/// be transmitted to more than once — [`StatefulKitty::resize_encode`] does it on
+/// every resize. The protocol says the old image and all its placements are
+/// then replaced, but a terminal that replaces only the image (Ghostty does)
+/// accumulates one unreachable virtual placement per transmission. A named
+/// placement is replaced in the map instead. The unicode placeholders carry no
+/// placement diacritic and still resolve to it, because it is the only one.
 fn transmit_virtual(img: &DynamicImage, id: u32, is_tmux: bool, compress: bool) -> String {
     let (w, h) = (img.width(), img.height());
     let img_rgba8 = img.to_rgba8();
@@ -259,7 +274,11 @@ fn transmit_virtual(img: &DynamicImage, id: u32, is_tmux: bool, compress: bool) 
         write!(data, "{escape}_Gq=2,").unwrap();
 
         if i == 0 {
-            write!(data, "i={id},a=T,U=1,f=32,{compression}t=d,s={w},v={h},").unwrap();
+            write!(
+                data,
+                "i={id},p={PLACEMENT},a=T,U=1,f=32,{compression}t=d,s={w},v={h},"
+            )
+            .unwrap();
         }
 
         // m=0 means over
@@ -774,6 +793,11 @@ mod tests {
         assert!(
             params.contains("f=32") && params.contains("s=64,v=32"),
             "{params}"
+        );
+        assert!(
+            params.contains("p=1,"),
+            "the virtual placement is NAMED, so a re-transmission to this id replaces it \
+             rather than piling up a second one: {params}"
         );
         assert_eq!(bytes, *img.to_rgba8().as_raw());
     }
