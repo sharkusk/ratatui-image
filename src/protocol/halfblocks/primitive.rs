@@ -151,6 +151,10 @@ mod tests {
 
         let data = encode(&img, size);
 
-        assert_eq!(data.len(), 458 * 144, "one entry per cell, not modulo 65536");
+        assert_eq!(
+            data.len(),
+            458 * 144,
+            "one entry per cell, not modulo 65536"
+        );
     }
 }

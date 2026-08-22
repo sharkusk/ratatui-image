@@ -34,6 +34,10 @@ pub enum Capability {
     Sixel,
     /// Reports supporting rectangular ops.
     RectangularOps,
+    /// Reports being able to inflate a zlib-compressed kitty transmission
+    /// (`o=z`), which is a sub-feature of the kitty graphics protocol in the
+    /// same way [`Capability::RectangularOps`] is.
+    KittyCompression,
     /// Reports font size in pixels.
     CellSize(Option<(u16, u16)>),
     /// Reports supporting text sizing protocol.
@@ -247,6 +251,7 @@ impl Picker {
                 size,
                 rand::random(),
                 self.is_tmux,
+                self.capabilities.contains(&Capability::KittyCompression),
             )?)),
             ProtocolType::Iterm2 => Ok(Protocol::ITerm2(Iterm2::new(image, size, self.is_tmux)?)),
         }
@@ -281,9 +286,11 @@ impl Picker {
                 is_tmux: self.is_tmux,
                 ..Sixel::default()
             }),
-            ProtocolType::Kitty => {
-                StatefulProtocolType::Kitty(StatefulKitty::new(random(), self.is_tmux))
-            }
+            ProtocolType::Kitty => StatefulProtocolType::Kitty(StatefulKitty::new(
+                random(),
+                self.is_tmux,
+                self.capabilities.contains(&Capability::KittyCompression),
+            )),
             ProtocolType::Iterm2 => StatefulProtocolType::ITerm2(Iterm2 {
                 is_tmux: self.is_tmux,
                 ..Iterm2::default()
@@ -508,6 +515,7 @@ fn interpret_parser_responses(
                 Some(Capability::Sixel)
             }
             Response::RectangularOps => Some(Capability::RectangularOps),
+            Response::KittyCompression => Some(Capability::KittyCompression),
             Response::CellSize(cell_size) => {
                 if let Some((w, h)) = cell_size {
                     font_size = Some((*w, *h).into());

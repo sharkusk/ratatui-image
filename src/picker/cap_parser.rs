@@ -2,6 +2,7 @@
 use std::{fmt::Write, time::Duration};
 
 use crate::picker::{ProtocolType, STDIN_READ_TIMEOUT_MILLIS};
+use crate::protocol::kitty::zlib;
 
 pub struct Parser {
     data: String,
@@ -21,6 +22,8 @@ pub enum Response {
     Kitty,
     Sixel,
     RectangularOps,
+    /// Reports being able to inflate a zlib-compressed transmission (`o=z`).
+    KittyCompression,
     CellSize(Option<(u16, u16)>),
     CursorPositionReport(u16, u16),
     Background(u8, u8, u8),
@@ -94,6 +97,19 @@ impl Parser {
         if !options.blacklist_protocols.contains(&ProtocolType::Kitty) {
             // Kitty graphics
             write!(buf, "{escape}_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA{escape}\\").unwrap();
+
+            // Kitty graphics transmission compression: the same one-pixel query
+            // with the payload deflated and `o=z` set. Specified and implemented
+            // are not the same thing, and a terminal that answers the query above
+            // but cannot inflate would drop every compressed image on the floor,
+            // so ask rather than assume. Its own image id tells the two replies
+            // apart.
+            let probe = base64_simd::STANDARD.encode_to_string(zlib(&[0, 0, 0]));
+            write!(
+                buf,
+                "{escape}_Gi=32,s=1,v=1,a=q,t=d,f=24,o=z;{probe}{escape}\\"
+            )
+            .unwrap();
         }
 
         if !options.blacklist_protocols.contains(&ProtocolType::Sixel) {
@@ -145,7 +161,7 @@ impl Parser {
                         // If the current sequence hasn't been identified yet, start a new one on Esc.
                         return self.restart();
                     }
-                    ("_Gi=31", ';') => {
+                    ("_Gi=31" | "_Gi=32", ';') => {
                         self.sequence = ResponseParseState::KittyResponse;
                     }
 
@@ -247,6 +263,7 @@ impl Parser {
                 '\\' => {
                     let caps = match &self.data[..] {
                         "_Gi=31;OK\x1b" => vec![Response::Kitty],
+                        "_Gi=32;OK\x1b" => vec![Response::KittyCompression],
                         _ => vec![],
                     };
                     self.restart();
@@ -270,7 +287,7 @@ impl Parser {
 mod tests {
     use std::assert_eq;
 
-    use super::{Parser, Response};
+    use super::{Parser, QueryStdioOptions, Response};
 
     fn parse(response: &str) -> Vec<Response> {
         let mut parser = Parser::new();
@@ -335,4 +352,49 @@ mod tests {
     // ],
     // );
     // }
+
+    /// The compression probe is the kitty probe with a deflated payload, and the
+    /// terminal is asked rather than assumed: one that answers the plain query
+    /// but cannot inflate would drop every compressed image on the floor.
+    #[test]
+    fn test_query_carries_a_compressed_probe() {
+        let q = Parser::query(false, QueryStdioOptions::default());
+        let (_, rest) = q
+            .split_once("\x1b_Gi=32,s=1,v=1,a=q,t=d,f=24,o=z;")
+            .expect("the compressed probe is in the query");
+        let (payload, _) = rest.split_once("\x1b\\").expect("the probe is terminated");
+
+        // The payload has to be a real zlib stream of the one pixel `s=1,v=1`
+        // and `f=24` promise, or the answer means nothing.
+        let bytes = base64_simd::STANDARD
+            .decode_to_vec(payload)
+            .expect("the probe payload is base64");
+        let mut raw = Vec::new();
+        std::io::copy(&mut flate2::read::ZlibDecoder::new(&bytes[..]), &mut raw)
+            .expect("the probe payload is one zlib stream");
+        assert_eq!(raw, vec![0, 0, 0], "one RGB pixel, as f=24 s=1 v=1 says");
+    }
+
+    #[test]
+    fn test_parse_compression_response() {
+        assert_eq!(
+            parse("\x1b_Gi=31;OK\x1b\\\x1b_Gi=32;OK\x1b\\\x1b[0n"),
+            vec![
+                Response::Kitty,
+                Response::KittyCompression,
+                Response::Status
+            ],
+        );
+    }
+
+    /// A terminal that does kitty graphics but not compression answers the
+    /// second probe with an error code, and must yield no capability at all —
+    /// this is the case the whole probe exists for.
+    #[test]
+    fn test_parse_compression_refused() {
+        assert_eq!(
+            parse("\x1b_Gi=31;OK\x1b\\\x1b_Gi=32;EINVAL:bad\x1b\\\x1b[0n"),
+            vec![Response::Kitty, Response::Status],
+        );
+    }
 }

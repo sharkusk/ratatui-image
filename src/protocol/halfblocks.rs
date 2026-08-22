@@ -152,7 +152,11 @@ mod tests {
         // Red over blue, so a cell drawn from the wrong half is unmistakable.
         let mut img = RgbImage::new(64, 64);
         for (_x, y, p) in img.enumerate_pixels_mut() {
-            *p = if y < 32 { Rgb([255, 0, 0]) } else { Rgb([0, 0, 255]) };
+            *p = if y < 32 {
+                Rgb([255, 0, 0])
+            } else {
+                Rgb([0, 0, 255])
+            };
         }
 
         let size = Size::new(458, 144); // 65952 cells: past the ceiling
@@ -164,11 +168,22 @@ mod tests {
         hbs.render(area, &mut buf);
 
         let top = buf.cell((10, 0)).expect("a cell on the first row").fg;
-        let bottom = buf.cell((10, size.height - 1)).expect("a cell on the last row").fg;
+        let bottom = buf
+            .cell((10, size.height - 1))
+            .expect("a cell on the last row")
+            .fg;
 
         assert_ne!(bottom, Color::Reset, "the last row is drawn at all");
-        assert_eq!(top, Color::Rgb(255, 0, 0), "the first row comes from the top of the image");
-        assert_eq!(bottom, Color::Rgb(0, 0, 255), "the last row comes from the bottom");
+        assert_eq!(
+            top,
+            Color::Rgb(255, 0, 0),
+            "the first row comes from the top of the image"
+        );
+        assert_eq!(
+            bottom,
+            Color::Rgb(0, 0, 255),
+            "the last row comes from the bottom"
+        );
     }
 
     #[test]
