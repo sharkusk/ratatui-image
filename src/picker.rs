@@ -243,13 +243,23 @@ impl Picker {
     ///
     /// The image must match the given area at the terminal's current font size.
     pub(crate) fn new_protocol_raw(&self, image: DynamicImage, size: Size) -> Result<Protocol> {
+        self.new_protocol_raw_with_id(image, size, random())
+    }
+
+    /// [`Picker::new_protocol_raw`], under a caller-chosen kitty image id.
+    fn new_protocol_raw_with_id(
+        &self,
+        image: DynamicImage,
+        size: Size,
+        id: u32,
+    ) -> Result<Protocol> {
         match self.protocol_type {
             ProtocolType::Halfblocks => Ok(Protocol::Halfblocks(Halfblocks::new(image, size)?)),
             ProtocolType::Sixel => Ok(Protocol::Sixel(Sixel::new(image, size, self.is_tmux)?)),
             ProtocolType::Kitty => Ok(Protocol::Kitty(Kitty::new(
                 image,
                 size,
-                rand::random(),
+                id,
                 self.is_tmux,
                 self.capabilities.contains(&Capability::KittyCompression),
             )?)),
@@ -264,6 +274,45 @@ impl Picker {
         size: Size,
         resize: Resize,
     ) -> Result<Protocol> {
+        self.new_protocol_id(image, size, resize, random())
+    }
+
+    /// [`Picker::new_protocol`], with the kitty image id chosen by the CALLER
+    /// rather than drawn at random.
+    ///
+    /// Kitty's unicode placeholders put the image id in EVERY cell of a placement
+    /// — the low 24 bits as the cell's foreground color, the high byte as a
+    /// diacritic — so the id is part of the rendered cells, not merely a handle on
+    /// the image. An application that re-encodes changing content into the same
+    /// area therefore repaints the whole placement rect whenever the id moves,
+    /// which a fresh random id does on every encode. Re-encoding under the id the
+    /// previous protocol used replaces the image data behind an unchanged
+    /// placement instead, so a changed picture costs the picture.
+    ///
+    /// Only the caller can know that two encodes are the same thing changing, so
+    /// only the caller can choose the id. Reuse one only for content drawn at the
+    /// same size in the same place; the transmission replaces whatever the
+    /// terminal already holds under it.
+    ///
+    /// Every other backend ignores `id` — none of them addresses its images by
+    /// one — so this is [`Picker::new_protocol`] exactly for those.
+    pub fn new_protocol_with_id(
+        &self,
+        image: DynamicImage,
+        size: Size,
+        resize: Resize,
+        id: u32,
+    ) -> Result<Protocol> {
+        self.new_protocol_id(image, size, resize, id)
+    }
+
+    fn new_protocol_id(
+        &self,
+        image: DynamicImage,
+        size: Size,
+        resize: Resize,
+        id: u32,
+    ) -> Result<Protocol> {
         let desired =
             Resize::round_pixel_size_to_cells(image.width(), image.height(), self.font_size);
         let (image, area) =
@@ -275,7 +324,7 @@ impl Picker {
                 None => (image, desired),
             };
 
-        self.new_protocol_raw(image, area)
+        self.new_protocol_raw_with_id(image, area, id)
     }
 
     /// Returns a new *stateful* protocol for [`crate::StatefulImage`] widgets.
@@ -638,8 +687,12 @@ fn query_with_timeout(
 mod tests {
     use std::assert_eq;
 
+    use image::DynamicImage;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::{Rect, Size};
+
     use crate::{
-        FontSize,
+        FontSize, Resize,
         picker::{Capability, Picker, ProtocolType},
     };
 
@@ -710,5 +763,50 @@ mod tests {
         ])
         .unwrap();
         assert!(!caps.contains(&Capability::TextSizingProtocol));
+    }
+
+    /// A caller-chosen id reaches the wire, and two encodes under one id are two
+    /// transmissions of the same image rather than two images.
+    ///
+    /// The id is what every placeholder cell of a placement carries, so this is
+    /// the difference between a changed picture costing the picture and costing
+    /// the whole rect of cells as well.
+    #[test]
+    fn test_new_protocol_with_id_transmits_under_the_callers_id() {
+        let picker = Picker {
+            font_size: FontSize::new(10, 20),
+            protocol_type: ProtocolType::Kitty,
+            background_color: None,
+            is_tmux: false,
+            capabilities: vec![Capability::Kitty],
+        };
+        let img = |v: u8| {
+            DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                20,
+                40,
+                image::Rgba([v, 0x40, 0x80, 0xff]),
+            ))
+        };
+        let transmit = |v: u8| {
+            let proto = picker
+                .new_protocol_with_id(img(v), Size::new(2, 2), Resize::Fit(None), 0x00B0_0007)
+                .expect("kitty encodes");
+            let mut buf = Buffer::empty(Rect::new(0, 0, 2, 2));
+            proto.render(Rect::new(0, 0, 2, 2), &mut buf);
+            buf.cell((0, 0))
+                .expect("the transmit rides the first cell")
+                .symbol()
+                .to_string()
+        };
+
+        let first = transmit(0x10);
+        let second = transmit(0x20);
+        for (n, t) in [("first", &first), ("second", &second)] {
+            assert!(
+                t.contains("i=11534343,"),
+                "{n} names the caller's id: {t:?}"
+            );
+        }
+        assert_ne!(first, second, "different pixels are still transmitted");
     }
 }
