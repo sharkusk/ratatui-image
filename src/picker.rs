@@ -46,10 +46,11 @@ pub enum Capability {
     /// Reports being able to read a kitty transmission from a POSIX shared memory
     /// object (`t=s`), which only a terminal on this machine can do.
     ///
-    /// Only probed for, and so only ever present, when
-    /// [`cap_parser::QueryStdioOptions::kitty_shared_memory_probe`] is set. With that
-    /// probe set, [`cap_parser::QueryStdioOptions::kitty_shared_memory_object`] is
-    /// honoured only where this capability is present.
+    /// Probed for, and so only ever present, whenever
+    /// [`cap_parser::QueryStdioOptions::kitty_shared_memory_object`] is set: the
+    /// stdio query itself writes a real object and asks the terminal to read it
+    /// back, and [`Picker`] uses shared memory for its own transmissions only
+    /// where this capability is present.
     KittySharedMemory,
     /// Reports font size in pixels.
     CellSize(Option<(u16, u16)>),
@@ -126,7 +127,6 @@ impl Picker {
         let (is_tmux, tmux_proto) = detect_tmux_and_outer_protocol_from_env();
 
         let kitty_shm = options.kitty_shared_memory_object;
-        let kitty_shm_probe = options.kitty_shared_memory_probe;
         let mut options_with_blacklist = options;
         let is_wezterm = env::var("WEZTERM_EXECUTABLE").is_ok_and(|s| !s.is_empty());
         let is_konsole = env::var("KONSOLE_VERSION").is_ok_and(|s| !s.is_empty());
@@ -150,7 +150,11 @@ impl Picker {
                     .or(iterm2_proto)
                     .unwrap_or(ProtocolType::Halfblocks);
 
-                let kitty_shm = resolve_kitty_shm(kitty_shm, kitty_shm_probe, &caps);
+                let kitty_shm = if caps.contains(&Capability::KittySharedMemory) {
+                    kitty_shm
+                } else {
+                    None
+                };
                 if let Some(font_size) = font_size {
                     Ok(Self {
                         font_size,
@@ -177,8 +181,8 @@ impl Picker {
                     tmux_proto.or_else(iterm2_from_env),
                     font_size_fallback(),
                 );
-                // Nothing answered at all, so a requested probe answered no.
-                p.kitty_shm = resolve_kitty_shm(kitty_shm, kitty_shm_probe, &[]);
+                // Nothing answered at all, so no capability was reported.
+                p.kitty_shm = None;
                 Ok(p)
             }
             Err(err) => Err(err),
@@ -570,23 +574,17 @@ fn query_stdio_capabilities(
     // `[1337n`: iTerm2 (some terminals implement the protocol but sadly not this custom CSI)
     // `[5n`: Device Status Report, implemented by all terminals, ensure that there is some
     // response and we don't hang reading forever.
-    // The shared memory probe asks the terminal to read a real object, so it has to
-    // exist before the query naming it goes out — and be gone again afterwards,
-    // which the guard's drop takes care of on every path out of here. If the object
-    // cannot be created the probe is dropped from the query rather than asked
-    // blindly, since an unanswerable probe would read as a refusal.
+    let (query, shm_probe_name) = Parser::query(is_tmux, options);
+    // `Parser::query` already wrote the shared memory probe's object (if any) before
+    // naming it in the query, since the terminal must be able to open it the moment
+    // it reads the escape. Kitty/Ghostty unlink it themselves once they've read it,
+    // so this guard is for every other outcome — ignored, refused, or never
+    // answered — which would otherwise leave it behind for the life of the machine.
     #[cfg(not(windows))]
-    let mut options = options;
-    #[cfg(not(windows))]
-    let _shm_probe = if options.kitty_shared_memory_probe {
-        let probe = ShmProbe::create();
-        options.kitty_shared_memory_probe = probe.is_some();
-        probe
-    } else {
-        None
-    };
+    let _unlink_shm_probe = shm_probe_name.map(ShmProbeUnlink);
+    #[cfg(windows)]
+    let _ = shm_probe_name;
 
-    let query = Parser::query(is_tmux, options);
     io::stdout().write_all(query.as_bytes())?;
     io::stdout().flush()?;
 
@@ -617,50 +615,20 @@ fn query_stdio_capabilities(
     Ok(())
 }
 
-/// Shared memory is used only where the caller asked for it and, if a probe was
-/// asked for too, only where the terminal answered it.
+/// Unlinks the named shared memory object when dropped.
 ///
-/// Without a probe this is [`QueryStdioOptions::kitty_shared_memory_object`]
-/// unchanged — the blind opt-in that field documents.
-fn resolve_kitty_shm(object: Option<u32>, probe: bool, caps: &[Capability]) -> Option<u32> {
-    if probe && !caps.contains(&Capability::KittySharedMemory) {
-        return None;
-    }
-    object
-}
-
-/// The shared memory object the `t=s` probe names, unlinked when this is dropped.
-///
-/// Kitty unlinks an object it has read, so the drop is for every other outcome: a
-/// terminal that ignored the probe, answered an error, or never answered at all
-/// would otherwise leave the object behind for the life of the machine.
+/// `Parser::query` writes and names the shared-memory probe's object before this
+/// side ever sees the terminal's answer, so cleanup lives here rather than in the
+/// query builder: kitty/Ghostty unlink an object once they've read it, so a gone
+/// object at drop time is the success case, not an error (`ENOENT` is ignored) —
+/// this guard exists for every other outcome, where the terminal ignored,
+/// refused, or never answered the probe at all.
 #[cfg(not(windows))]
-struct ShmProbe(String);
+struct ShmProbeUnlink(String);
 
 #[cfg(not(windows))]
-impl ShmProbe {
-    /// Create the object and fill it with the one RGBA pixel the probe's
-    /// `f=32,s=1,v=1` promises.
-    ///
-    /// `None` if the platform refused, in which case the probe is simply not sent
-    /// and the capability cannot appear.
-    fn create() -> Option<Self> {
-        // Exactly the one RGBA pixel the probe's `f=32,s=1,v=1` promises: a
-        // terminal refuses an object smaller than `s * v * bpp`.
-        const PIXEL: [u8; 4] = [0, 0, 0, 0];
-
-        let name = cap_parser::shm_probe_name();
-        // Named before it is filled, so that a half-made object is still unlinked.
-        let probe = Self(name);
-        crate::protocol::kitty::shm_write(&probe.0, &PIXEL).ok()?;
-        Some(probe)
-    }
-}
-
-#[cfg(not(windows))]
-impl Drop for ShmProbe {
+impl Drop for ShmProbeUnlink {
     fn drop(&mut self) {
-        // Gone already is the successful case, not an error.
         let _ = rustix::shm::unlink(self.0.as_str());
     }
 }
@@ -793,27 +761,37 @@ mod tests {
 
     use crate::{
         FontSize, Resize,
-        picker::{Capability, Picker, ProtocolType},
+        picker::{Capability, Picker, ProtocolType, cap_parser::QueryStdioOptions},
     };
 
     use super::{cap_parser::Response, fallback_picker, interpret_parser_responses};
 
-    /// A probe that cannot create its object is never sent, so an unusable name
-    /// or mode would silently mean "this terminal said no" for everybody. The
-    /// syscall has to be exercised, not just the string it takes.
+    /// Exercises the query-side probe end to end: `Parser::query` writes a real
+    /// object and names it in the escape, and `ShmProbeUnlink` — the guard
+    /// `query_stdio_capabilities` wraps the name in — is what's responsible for
+    /// cleaning it up afterward. The object has to actually exist while the
+    /// guard is alive and actually be gone once it drops, not just the string
+    /// plumbing between the two.
     #[test]
     #[cfg(not(windows))]
     fn test_shm_probe_round_trips() {
-        use super::{ShmProbe, cap_parser::shm_probe_name};
+        use super::ShmProbeUnlink;
 
-        let name = shm_probe_name();
-        let probe = ShmProbe::create().expect("this platform creates the probe object");
+        let (_query, name) = super::cap_parser::Parser::query(
+            false,
+            QueryStdioOptions {
+                kitty_shared_memory_object: Some(std::process::id()),
+                ..Default::default()
+            },
+        );
+        let name = name.expect("this platform writes shared memory");
+
         let fd = rustix::shm::open(
             name.as_str(),
             rustix::shm::OFlags::RDONLY,
             rustix::fs::Mode::empty(),
         )
-        .expect("the object exists while the probe is alive");
+        .expect("the object exists before the guard has dropped");
         // At least the one RGBA pixel `f=32,s=1,v=1` promises, since a terminal
         // rejects an object smaller than `s * v * bpp`. Not exactly: macOS rounds
         // a shared memory object up to a page, so this reads 16384 there and 4 on
@@ -825,7 +803,7 @@ mod tests {
         );
         drop(fd);
 
-        drop(probe);
+        drop(ShmProbeUnlink(name.clone()));
         assert!(
             rustix::shm::open(
                 name.as_str(),
@@ -833,31 +811,7 @@ mod tests {
                 rustix::fs::Mode::empty(),
             )
             .is_err(),
-            "the probe leaves nothing behind for a terminal that never read it"
-        );
-    }
-
-    /// The blind opt-in is unchanged when no probe was asked for, and gated on the
-    /// answer when one was — the whole point of adding the probe.
-    #[test]
-    fn test_resolve_kitty_shm() {
-        use super::resolve_kitty_shm;
-
-        assert_eq!(resolve_kitty_shm(Some(7), false, &[]), Some(7));
-        assert_eq!(resolve_kitty_shm(Some(7), true, &[]), None);
-        assert_eq!(
-            resolve_kitty_shm(Some(7), true, &[Capability::Kitty]),
-            None,
-            "kitty graphics does not imply reaching our filesystem"
-        );
-        assert_eq!(
-            resolve_kitty_shm(Some(7), true, &[Capability::KittySharedMemory]),
-            Some(7)
-        );
-        assert_eq!(
-            resolve_kitty_shm(None, true, &[Capability::KittySharedMemory]),
-            None,
-            "answered, but never asked for"
+            "the guard leaves nothing behind for a terminal that never read it"
         );
     }
 
