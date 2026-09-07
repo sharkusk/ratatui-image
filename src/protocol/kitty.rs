@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(windows))]
 use rustix::{
     fs::Mode,
-    io::write as rustix_write,
+    mm::{MapFlags, ProtFlags, mmap, munmap},
     shm::{self, OFlags as ShmOFlags},
 };
 
@@ -271,6 +271,54 @@ fn transmit_or_shm(
     Ok(transmit_virtual(img, id, is_tmux, compress))
 }
 
+/// Create a shared memory object of exactly `bytes.len()` and fill it.
+///
+/// The bytes go in through a mapping rather than `write(2)`, because macOS does not
+/// implement read/write on a POSIX shared memory object at all — it answers `ENXIO`
+/// — so a write loop transmits nothing there. A mapping is also what the terminal
+/// uses to read it back at the other end.
+///
+/// The object is sized to exactly the payload, since a terminal rejects one smaller
+/// than `s * v * bpp` (Ghostty: "shared memory size too small").
+#[cfg(not(windows))]
+pub(crate) fn shm_write(name: &str, bytes: &[u8]) -> Result<()> {
+    let fd = shm::open(
+        name,
+        ShmOFlags::CREATE | ShmOFlags::RDWR | ShmOFlags::TRUNC,
+        Mode::RUSR | Mode::WUSR,
+    )?;
+    rustix::fs::ftruncate(&fd, bytes.len() as u64)?;
+    // SAFETY: a fresh mapping of a descriptor we just created and sized to
+    // `bytes.len()`, written once and unmapped before it can be aliased.
+    unsafe {
+        let ptr = mmap(
+            std::ptr::null_mut(),
+            bytes.len(),
+            ProtFlags::READ | ProtFlags::WRITE,
+            MapFlags::SHARED,
+            &fd,
+            0,
+        )?;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
+        munmap(ptr, bytes.len())?;
+    }
+    Ok(())
+}
+
+/// The name of the shared memory object one image is handed over in.
+///
+/// Short on purpose. POSIX only promises 14 bytes and Linux allows 255, but macOS
+/// caps the whole name at 31 bytes including the leading slash (`PSHMNAMLEN`), and
+/// anything longer is refused with `ENAMETOOLONG` — measured on macOS 15, where
+/// `/ratatui-image-kitty-shm12345-4294967295` never opens at all. A refused
+/// transmit is silent: the image is never stored, and every placement naming it
+/// draws nothing. So the name has to fit the smallest limit we ship on, which at
+/// u32's widest this does exactly.
+#[cfg(not(windows))]
+fn shm_name(shm_pid: u32, id: u32) -> String {
+    format!("/rtui-{shm_pid}-{id}")
+}
+
 /// Transmit via POSIX shared memory object (t=s).
 ///
 /// Writes raw RGBA pixels into a named SHM object, then emits a single kitty APC chunk
@@ -281,19 +329,8 @@ fn transmit_shm(img: &DynamicImage, id: u32, shm_pid: u32, is_tmux: bool) -> Res
     let img_rgba8 = img.to_rgba8();
     let bytes = img_rgba8.as_raw();
 
-    let shm_name = format!("/ratatui-image-kitty-shm{shm_pid}-{id}");
-
-    let fd = shm::open(
-        &shm_name,
-        ShmOFlags::CREATE | ShmOFlags::RDWR | ShmOFlags::TRUNC,
-        Mode::RUSR | Mode::WUSR,
-    )?;
-    rustix::fs::ftruncate(&fd, bytes.len() as u64)?;
-    let mut offset = 0;
-    while offset < bytes.len() {
-        offset += rustix_write(&fd, &bytes[offset..])?;
-    }
-    drop(fd);
+    let shm_name = shm_name(shm_pid, id);
+    shm_write(&shm_name, bytes)?;
 
     let (start, escape, end) = Parser::tmux_start_escape_end(is_tmux);
 
@@ -786,5 +823,24 @@ mod tests {
         std::io::copy(&mut flate2::read::ZlibDecoder::new(&bytes[..]), &mut out)
             .expect("the whole payload is one zlib stream");
         assert_eq!(out, *raw.as_raw());
+    }
+
+    /// macOS refuses a shared memory name longer than 31 bytes, and a refused
+    /// transmit draws nothing rather than saying so — so the widest name the
+    /// scheme can produce has to fit, not merely a typical one.
+    #[test]
+    #[cfg(not(windows))]
+    fn shm_names_fit_the_tightest_platform_limit() {
+        const PSHMNAMLEN: usize = 31;
+        let widest = super::shm_name(u32::MAX, u32::MAX);
+        assert!(
+            widest.len() <= PSHMNAMLEN,
+            "`{widest}` is {} bytes, macOS allows {PSHMNAMLEN}",
+            widest.len()
+        );
+        assert!(
+            widest.starts_with('/') && !widest[1..].contains('/'),
+            "one leading slash and no others, for portability: {widest}"
+        );
     }
 }
