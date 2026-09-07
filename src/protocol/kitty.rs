@@ -286,6 +286,18 @@ fn transmit_or_shm(
 ///
 /// The object is sized to exactly the payload, since a terminal rejects one smaller
 /// than `s * v * bpp` (Ghostty: "shared memory size too small").
+///
+/// On Linux, `ftruncate` alone does not reserve the pages it names: a POSIX shared
+/// memory object lives on `tmpfs`, and `tmpfs` allocates on first touch rather than
+/// on `ftruncate`, so an object bigger than the space left in `/dev/shm` (64 MB by
+/// default in a Docker container) sails through `ftruncate` and only finds out when
+/// the copy below touches an unbacked page — at which point the kernel delivers
+/// `SIGBUS`, which is not a `Result` this function can hand back and takes the whole
+/// process down with it. `fallocate` right after `ftruncate` forces the reservation
+/// up front, so a full `tmpfs` answers `ENOSPC` here instead, as an ordinary error a
+/// caller can fall back from. macOS needs no such call: its shared memory objects
+/// are ordinary anonymous memory with no separate quota to exhaust, and `fallocate`
+/// is not implemented there in the first place.
 #[cfg(not(windows))]
 pub(crate) fn shm_write(name: &str, bytes: &[u8]) -> Result<()> {
     let fd = shm::open(
@@ -294,6 +306,13 @@ pub(crate) fn shm_write(name: &str, bytes: &[u8]) -> Result<()> {
         Mode::RUSR | Mode::WUSR,
     )?;
     rustix::fs::ftruncate(&fd, bytes.len() as u64)?;
+    #[cfg(target_os = "linux")]
+    rustix::fs::fallocate(
+        &fd,
+        rustix::fs::FallocateFlags::empty(),
+        0,
+        bytes.len() as u64,
+    )?;
     // SAFETY: a fresh mapping of a descriptor we just created and sized to
     // `bytes.len()`, written once and unmapped before it can be aliased.
     unsafe {
