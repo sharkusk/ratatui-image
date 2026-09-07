@@ -8,7 +8,7 @@
 use std::borrow::Cow;
 use std::fmt::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 #[cfg(all(not(windows), not(target_os = "linux")))]
 use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
@@ -346,7 +346,7 @@ pub(crate) fn shm_write(name: &str, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// The name of the shared memory object one image is handed over in.
+/// The name of the shared memory object one TRANSMIT is handed over in.
 ///
 /// Short on purpose. POSIX only promises 14 bytes and Linux allows 255, but macOS
 /// caps the whole name at 31 bytes including the leading slash (`PSHMNAMLEN`), and
@@ -355,22 +355,49 @@ pub(crate) fn shm_write(name: &str, bytes: &[u8]) -> Result<()> {
 /// transmit is silent: the image is never stored, and every placement naming it
 /// draws nothing. So the name has to fit the smallest limit we ship on, which at
 /// u32's widest this does exactly.
+///
+/// `serial` is not the kitty image id — see [`transmit_shm`] for why the two must
+/// not be conflated.
 #[cfg(not(windows))]
-fn shm_name(shm_pid: u32, id: u32) -> String {
-    format!("/rtui-{shm_pid}-{id}")
+fn shm_name(shm_pid: u32, serial: u32) -> String {
+    format!("/rtui-{shm_pid}-{serial}")
 }
 
 /// Transmit via POSIX shared memory object (t=s).
 ///
 /// Writes raw RGBA pixels into a named SHM object, then emits a single kitty APC chunk
 /// pointing at it. The SHM object is intentionally left alive for kitty to unlink.
+///
+/// **The object is named from a per-transmit serial, never from the kitty image
+/// id.** `id` is stable across re-transmits of the same picture — deliberately, a
+/// caller such as [`StatefulKitty::resize_encode`] or a `new_protocol_with_id`
+/// caller reuses it exactly so a placement need not be rebuilt — but the object
+/// handover is ASYNCHRONOUS: writing this escape only tells the terminal the
+/// object is ready, and the terminal opens and reads it whenever it next gets to
+/// it, which is unspecified relative to when the next transmit runs. From the
+/// moment this function returns, the terminal owns the object; it unlinks it once
+/// it has read it. Naming the object after `id` would mean a second transmit of
+/// the same picture — a resize, a new frame — recreates (`O_CREAT|O_TRUNC`) the
+/// very object the terminal may still be midway through reading for the first
+/// one, so the terminal finds truncated bytes, the wrong frame's bytes, or
+/// nothing at all (Ghostty answers with "shared memory size too small" and drops
+/// the frame). A fresh name every transmit means two transmits can never name the
+/// same object, so neither can ever observe the other's write — the id in the
+/// escape's `i=` parameter is what tells the terminal which image the new pixels
+/// belong to, and the object's name has no need to repeat it.
 #[cfg(not(windows))]
 fn transmit_shm(img: &DynamicImage, id: u32, shm_pid: u32, is_tmux: bool) -> Result<String> {
     let (w, h) = (img.width(), img.height());
     let img_rgba8 = img.to_rgba8();
     let bytes = img_rgba8.as_raw();
 
-    let shm_name = shm_name(shm_pid, id);
+    // A serial per transmit, never the image id — see this function's doc comment.
+    // Wrapping is fine and unreachable in practice: it would take four billion
+    // transmits, and the name only has to be unique against objects a terminal has
+    // not finished reading yet.
+    static SERIAL: AtomicU32 = AtomicU32::new(0);
+    let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
+    let shm_name = shm_name(shm_pid, serial);
     shm_write(&shm_name, bytes)?;
 
     let (start, escape, end) = Parser::tmux_start_escape_end(is_tmux);
@@ -888,7 +915,9 @@ mod tests {
 
     /// macOS refuses a shared memory name longer than 31 bytes, and a refused
     /// transmit draws nothing rather than saying so — so the widest name the
-    /// scheme can produce has to fit, not merely a typical one.
+    /// scheme can produce has to fit, not merely a typical one. The serial is a
+    /// `u32` exactly so this stays true: a `u64` serial's widest value would blow
+    /// the budget the pid alone already spends most of.
     #[test]
     #[cfg(not(windows))]
     fn shm_names_fit_the_tightest_platform_limit() {
@@ -903,5 +932,60 @@ mod tests {
             widest.starts_with('/') && !widest[1..].contains('/'),
             "one leading slash and no others, for portability: {widest}"
         );
+    }
+
+    /// The probe's own object (`/rtui-{pid}-probe`, [`crate::picker::cap_parser::shm_probe_name`])
+    /// must never collide with a real transmit's — it is unlinked on drop from a
+    /// path a live transmit could otherwise still be using. It cannot: a serial is
+    /// always digits, and `probe` is not a `u32`, so the two namespaces are
+    /// disjoint by construction. This pins that rather than trusting it.
+    #[test]
+    #[cfg(not(windows))]
+    fn probe_name_cannot_collide_with_a_transmit_serial() {
+        let pid = std::process::id();
+        let probe_name = crate::picker::cap_parser::shm_probe_name();
+        for serial in [0, 1, 42, u32::MAX] {
+            let transmit_name = super::shm_name(pid, serial);
+            assert_ne!(
+                probe_name, transmit_name,
+                "serial {serial} must never spell the probe's own name"
+            );
+        }
+    }
+
+    /// Two transmits of the SAME image id must still land in two different
+    /// objects — that is the entire fix: the terminal owns the first object
+    /// asynchronously from the moment its escape is written, and a second
+    /// transmit reusing that name would recreate it out from under a reader that
+    /// has not gotten to it yet. See [`super::transmit_shm`]'s doc comment.
+    #[test]
+    #[cfg(not(windows))]
+    fn consecutive_shm_transmits_of_the_same_id_use_different_objects() {
+        let img = canvas();
+        let first = super::transmit_shm(&img, 7, std::process::id(), false)
+            .expect("this platform writes shared memory");
+        let second = super::transmit_shm(&img, 7, std::process::id(), false)
+            .expect("this platform writes shared memory");
+
+        let name_of = |seq: &str| {
+            let start = seq.find(";").expect("payload starts after the header") + 1;
+            let end = seq.rfind("\x1b\\").expect("the ST ends the payload");
+            let name = base64_simd::STANDARD
+                .decode_to_vec(&seq[start..end])
+                .expect("the payload is base64");
+            String::from_utf8(name).expect("the object name is ASCII")
+        };
+        let (first_name, second_name) = (name_of(&first), name_of(&second));
+        assert_ne!(
+            first_name, second_name,
+            "same image id (7), but the object name must still differ so the second \
+             transmit can never touch an object the terminal may still be reading \
+             from the first: {first_name:?} vs {second_name:?}"
+        );
+
+        // Clean up: a successful `t=s` transmit is left for the terminal to
+        // unlink, which nothing here plays the part of.
+        let _ = rustix::shm::unlink(first_name);
+        let _ = rustix::shm::unlink(second_name);
     }
 }
