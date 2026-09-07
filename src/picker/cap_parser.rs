@@ -22,6 +22,7 @@ pub enum Response {
     Sixel,
     RectangularOps,
     KittyCompression,
+    KittySharedMemory,
     CellSize(Option<(u16, u16)>),
     CursorPositionReport(u16, u16),
     Background(u8, u8, u8),
@@ -68,6 +69,21 @@ pub struct QueryStdioOptions {
     /// unlinking it after reading. Untransmitted kitty images must be manually cleaned up by the
     /// user.
     pub kitty_shared_memory_object: Option<u32>,
+    /// Probe whether the terminal can actually read a POSIX shared memory object (`t=s`).
+    ///
+    /// [`Self::kitty_shared_memory_object`] on its own is a blind opt-in: a terminal
+    /// running on another machine — over ssh, most obviously — cannot open the object,
+    /// so the transmission fails and every placement naming that image draws nothing.
+    /// This probe removes that cliff. It creates a one-pixel shared memory object,
+    /// asks the terminal to read it with the protocol's own query action, and reports
+    /// [`crate::picker::Capability::KittySharedMemory`] only if the terminal answered
+    /// `OK`; the object is unlinked again either way.
+    ///
+    /// With the probe set, [`Self::kitty_shared_memory_object`] is honoured only where
+    /// the terminal answered — so the two are normally set together. Without it, that
+    /// field keeps its blind behaviour. Windows accepts the option and never reports
+    /// the capability.
+    pub kitty_shared_memory_probe: bool,
 }
 
 impl Default for QueryStdioOptions {
@@ -79,8 +95,21 @@ impl Default for QueryStdioOptions {
             blacklist_protocols: Vec::new(),
             kitty_compression: false,
             kitty_shared_memory_object: None,
+            kitty_shared_memory_probe: false,
         }
     }
+}
+
+/// The name of the shared memory object the `t=s` probe points the terminal at.
+///
+/// Deterministic, so that whoever creates the object and the query that names it
+/// agree without passing a string between them. It carries the same prefix a real
+/// image transmission uses — and lives under the same 31-byte macOS ceiling, see
+/// [`crate::protocol::kitty`] — and ends in `probe` where those end in an image
+/// id, so it can never collide with one and the same cleanup finds it.
+#[cfg(not(windows))]
+pub(crate) fn shm_probe_name() -> String {
+    format!("/rtui-{}-probe", std::process::id())
 }
 
 impl Default for Parser {
@@ -131,6 +160,18 @@ impl Parser {
                     "{escape}_Gi=32,s=1,v=1,a=q,t=d,f=24,o=z;{PROBE}{escape}\\"
                 )
                 .unwrap();
+            }
+
+            // Kitty shared memory transmission: the same one-pixel query pointed at a
+            // real shared memory object instead of at inline data, which only a terminal
+            // on this machine can open. Its own image id tells the replies apart, and the
+            // payload is the object's NAME rather than its contents. A successful reply
+            // will add `KittySharedMemory` to the capabilities.
+            #[cfg(not(windows))]
+            if options.kitty_shared_memory_probe {
+                write!(buf, "{escape}_Gi=33,s=1,v=1,a=q,t=s,f=32;").unwrap();
+                base64_simd::STANDARD.encode_append(shm_probe_name().as_bytes(), &mut buf);
+                write!(buf, "{escape}\\").unwrap();
             }
         }
 
@@ -183,7 +224,7 @@ impl Parser {
                         // If the current sequence hasn't been identified yet, start a new one on Esc.
                         return self.restart();
                     }
-                    ("_Gi=31" | "_Gi=32", ';') => {
+                    ("_Gi=31" | "_Gi=32" | "_Gi=33", ';') => {
                         self.sequence = ResponseParseState::KittyResponse;
                     }
 
@@ -286,6 +327,7 @@ impl Parser {
                     let caps = match &self.data[..] {
                         "_Gi=31;OK\x1b" => vec![Response::Kitty],
                         "_Gi=32;OK\x1b" => vec![Response::KittyCompression],
+                        "_Gi=33;OK\x1b" => vec![Response::KittySharedMemory],
                         _ => vec![],
                     };
                     self.restart();
@@ -434,6 +476,78 @@ mod tests {
     fn test_parse_compression_refused() {
         assert_eq!(
             parse("\x1b_Gi=31;OK\x1b\\\x1b_Gi=32;EINVAL:bad\x1b\\\x1b[0n"),
+            vec![Response::Kitty, Response::Status],
+        );
+    }
+
+    /// The shared memory probe is off by default, so
+    /// `Capability::KittySharedMemory` can only ever appear where the probe was
+    /// sent.
+    #[test]
+    fn test_query_omits_shared_memory_probe_by_default() {
+        let q = Parser::query(false, QueryStdioOptions::default());
+        assert!(
+            !q.contains("_Gi=33"),
+            "the shared memory probe must be opt-in: {q}"
+        );
+    }
+
+    /// The shared memory probe is the kitty probe with `t=s`, and its payload is
+    /// the NAME of an object rather than pixels: a terminal on another machine
+    /// cannot open it, which is the whole point of asking.
+    #[test]
+    #[cfg(not(windows))]
+    fn test_query_names_a_shared_memory_object_when_opted_in() {
+        let q = Parser::query(
+            false,
+            QueryStdioOptions {
+                kitty_shared_memory_probe: true,
+                ..Default::default()
+            },
+        );
+        let (_, rest) = q
+            .split_once("\x1b_Gi=33,s=1,v=1,a=q,t=s,f=32;")
+            .expect("the shared memory probe is in the query");
+        let (payload, _) = rest.split_once("\x1b\\").expect("the probe is terminated");
+
+        let name = base64_simd::STANDARD
+            .decode_to_vec(payload)
+            .expect("the probe payload is base64");
+        let name = String::from_utf8(name).expect("the probe payload is an object name");
+        assert_eq!(name, super::shm_probe_name(), "the object we created");
+        assert!(
+            name.starts_with('/') && name.ends_with("-probe"),
+            "a portable name that cannot collide with an image id: {name}"
+        );
+        assert!(
+            name.contains(&std::process::id().to_string()),
+            "the name is this process's: {name}"
+        );
+        // The same 31-byte macOS ceiling every shared memory name lives under,
+        // measured against the widest pid rather than this run's.
+        let widest = name.len() - std::process::id().to_string().len() + 10;
+        assert!(widest <= 31, "`{name}` is {widest} bytes at the widest pid");
+    }
+
+    #[test]
+    fn test_parse_shared_memory_response() {
+        assert_eq!(
+            parse("\x1b_Gi=31;OK\x1b\\\x1b_Gi=33;OK\x1b\\\x1b[0n"),
+            vec![
+                Response::Kitty,
+                Response::KittySharedMemory,
+                Response::Status
+            ],
+        );
+    }
+
+    /// A terminal that cannot reach the object — anything remote — answers with
+    /// an error, and must yield no capability: transmitting to it anyway would
+    /// draw nothing at all.
+    #[test]
+    fn test_parse_shared_memory_refused() {
+        assert_eq!(
+            parse("\x1b_Gi=31;OK\x1b\\\x1b_Gi=33;EBADF:no such file\x1b\\\x1b[0n"),
             vec![Response::Kitty, Response::Status],
         );
     }
