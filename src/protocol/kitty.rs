@@ -10,10 +10,11 @@ use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(all(not(windows), not(target_os = "linux")))]
+use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 #[cfg(not(windows))]
 use rustix::{
     fs::Mode,
-    mm::{MapFlags, ProtFlags, mmap, munmap},
     shm::{self, OFlags as ShmOFlags},
 };
 
@@ -279,26 +280,48 @@ fn transmit_or_shm(
 
 /// Create a shared memory object of exactly `bytes.len()` and fill it.
 ///
-/// The bytes go in through a mapping rather than `write(2)`, because macOS does not
-/// implement read/write on a POSIX shared memory object at all — it answers `ENXIO`
-/// — so a write loop transmits nothing there. A mapping is also what the terminal
-/// uses to read it back at the other end.
+/// **Linux writes through the descriptor.** `write(2)` on a POSIX shared memory
+/// object allocates the `tmpfs` pages it touches inside the syscall itself —
+/// unlike `ftruncate`, which only names a length and lets `tmpfs` allocate on
+/// first touch — so there is nothing to reserve up front and no mapping to make:
+/// an object bigger than the space left in `/dev/shm` (64 MB by default in a
+/// Docker container) answers `write_all` with an ordinary `io::Error` — `ENOSPC`,
+/// or a short write — which the caller already turns into a fallback like any
+/// other failure. `ftruncate` is unnecessary too, since the write itself sets the
+/// object's length. `shm::open` hands back an `OwnedFd`, and `File`'s `From`
+/// impl for it needs no `unsafe` at all.
 ///
-/// The object is sized to exactly the payload, since a terminal rejects one smaller
-/// than `s * v * bpp` (Ghostty: "shared memory size too small").
+/// The object still ends up sized to exactly the payload — a terminal rejects one
+/// smaller than `s * v * bpp` (Ghostty: "shared memory size too small") — which
+/// falls out of writing exactly `bytes.len()` bytes to a fresh object.
+#[cfg(all(not(windows), target_os = "linux"))]
+pub(crate) fn shm_write(name: &str, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+
+    let fd = shm::open(
+        name,
+        ShmOFlags::CREATE | ShmOFlags::RDWR | ShmOFlags::TRUNC,
+        Mode::RUSR | Mode::WUSR,
+    )?;
+    std::fs::File::from(fd).write_all(bytes)?;
+    Ok(())
+}
+
+/// Create a shared memory object of exactly `bytes.len()` and fill it.
 ///
-/// On Linux, `ftruncate` alone does not reserve the pages it names: a POSIX shared
-/// memory object lives on `tmpfs`, and `tmpfs` allocates on first touch rather than
-/// on `ftruncate`, so an object bigger than the space left in `/dev/shm` (64 MB by
-/// default in a Docker container) sails through `ftruncate` and only finds out when
-/// the copy below touches an unbacked page — at which point the kernel delivers
-/// `SIGBUS`, which is not a `Result` this function can hand back and takes the whole
-/// process down with it. `fallocate` right after `ftruncate` forces the reservation
-/// up front, so a full `tmpfs` answers `ENOSPC` here instead, as an ordinary error a
-/// caller can fall back from. macOS needs no such call: its shared memory objects
-/// are ordinary anonymous memory with no separate quota to exhaust, and `fallocate`
-/// is not implemented there in the first place.
-#[cfg(not(windows))]
+/// **Every non-Linux Unix goes in through a mapping instead of `write(2)`**,
+/// because macOS does not implement read/write on a POSIX shared memory object at
+/// all — it answers `ENXIO` — so a write loop transmits nothing there. A mapping
+/// is also what the terminal uses to read it back at the other end. macOS's
+/// shared memory objects are ordinary anonymous memory with no separate `tmpfs`
+/// quota to run out of, so `ftruncate` alone already reserves what it names here
+/// (unlike on Linux — see the `target_os = "linux"` twin of this function, which
+/// writes through the descriptor instead and needs neither this mapping nor a
+/// reservation).
+///
+/// The object is sized to exactly the payload, since a terminal rejects one
+/// smaller than `s * v * bpp` (Ghostty: "shared memory size too small").
+#[cfg(all(not(windows), not(target_os = "linux")))]
 pub(crate) fn shm_write(name: &str, bytes: &[u8]) -> Result<()> {
     let fd = shm::open(
         name,
@@ -306,13 +329,6 @@ pub(crate) fn shm_write(name: &str, bytes: &[u8]) -> Result<()> {
         Mode::RUSR | Mode::WUSR,
     )?;
     rustix::fs::ftruncate(&fd, bytes.len() as u64)?;
-    #[cfg(target_os = "linux")]
-    rustix::fs::fallocate(
-        &fd,
-        rustix::fs::FallocateFlags::empty(),
-        0,
-        bytes.len() as u64,
-    )?;
     // SAFETY: a fresh mapping of a descriptor we just created and sized to
     // `bytes.len()`, written once and unmapped before it can be aliased.
     unsafe {
