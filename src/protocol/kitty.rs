@@ -400,9 +400,10 @@ pub(crate) fn shm_name(shm_pid: u32, serial: u32) -> String {
 /// **The object is named from a per-transmit random suffix, never from the kitty
 /// image id, and never from a second counter either.** `id` is stable across
 /// re-transmits of the same picture — deliberately, a caller such as
-/// [`StatefulKitty::resize_encode`] or a `new_protocol_with_id` caller reuses it
-/// exactly so a placement need not be rebuilt — but the object handover is
-/// ASYNCHRONOUS in a way the escape stream itself is not: a repeated base64
+/// [`StatefulKitty::resize_encode`] or a caller that built [`Kitty::new`] under
+/// its own chosen `id` reuses it exactly so a placement need not be rebuilt —
+/// but the object handover is ASYNCHRONOUS in a way the escape stream itself
+/// is not: a repeated base64
 /// transmit under one `id` is harmless, because the wire is ordered and the
 /// terminal simply replaces the image when it gets to the second one. A repeated
 /// shm NAME is not, because the terminal opens and reads that object whenever it
@@ -466,8 +467,8 @@ fn transmit_shm(
 /// The virtual placement is left ANONYMOUS (`p=0`, i.e. no `p=` key at all) —
 /// the protocol's default, which means "assign me an internal id". An id can be
 /// transmitted to more than once — [`StatefulKitty::resize_encode`] does it on
-/// every resize, and so does any caller that took its id from
-/// [`crate::picker::Picker::new_protocol_with_id`]. The protocol says the old
+/// every resize, and so does any caller that built [`Kitty::new`] under its own
+/// chosen `id`. The protocol says the old
 /// image and all its placements are then replaced, and a conforming terminal
 /// does exactly that. Ghostty (≤1.3.1) replaced only the image and left the
 /// placement behind, which this crate used to work around by naming the
