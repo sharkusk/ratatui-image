@@ -933,7 +933,10 @@ mod tests {
                 t.contains("i=11534343,"),
                 "{n} names the caller's id: {t:?}"
             );
-            assert!(t.contains("p=1,"), "{n} names its placement: {t:?}");
+            assert!(
+                !t.contains("p="),
+                "{n} leaves its placement anonymous: {t:?}"
+            );
         }
         assert_ne!(first, second, "different pixels are still transmitted");
     }

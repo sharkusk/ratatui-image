@@ -29,12 +29,6 @@ use ratatui::{buffer::Buffer, layout::Rect};
 
 use super::{ProtocolTrait, StatefulProtocolTrait};
 
-/// The placement id every virtual placement is created under.
-///
-/// Placement ids are scoped to their image, so one constant serves every image;
-/// see [`transmit_base64`] for why it is stated rather than left at 0.
-const PLACEMENT: u32 = 1;
-
 #[derive(Default, Clone)]
 struct KittyProtoState {
     transmitted: Arc<AtomicBool>,
@@ -469,16 +463,20 @@ fn transmit_shm(
 /// probe: a terminal that cannot inflate refuses the transmission outright, and
 /// every placement naming the image then draws nothing at all.
 ///
-/// The virtual placement is NAMED (`p=PLACEMENT`) rather than left at the
-/// protocol's default of `p=0`, which means "assign me an internal id". An id can
-/// be transmitted to more than once — [`StatefulKitty::resize_encode`] does it on
+/// The virtual placement is left ANONYMOUS (`p=0`, i.e. no `p=` key at all) —
+/// the protocol's default, which means "assign me an internal id". An id can be
+/// transmitted to more than once — [`StatefulKitty::resize_encode`] does it on
 /// every resize, and so does any caller that took its id from
 /// [`crate::picker::Picker::new_protocol_with_id`]. The protocol says the old
-/// image and all its placements are then replaced, but a terminal that replaces
-/// only the image (Ghostty does) accumulates one unreachable virtual placement
-/// per transmission. A named placement is replaced in the map instead. The
-/// unicode placeholders carry no placement diacritic and still resolve to it,
-/// because it is the only one.
+/// image and all its placements are then replaced, and a conforming terminal
+/// does exactly that. Ghostty (≤1.3.1) replaced only the image and left the
+/// placement behind, which this crate used to work around by naming the
+/// placement so a re-transmit would replace it in the map instead of piling up
+/// a duplicate; measuring that leak directly (200,000 re-transmits, ~30MB
+/// resident growth, no visible artifact, no measurable latency cost) showed it
+/// minor enough to drop now that Ghostty's own fix (ghostty#13723) exists
+/// upstream. The unicode placeholders carry no placement diacritic and still
+/// resolve to the anonymous placement, because it is the only one.
 fn transmit_base64(bytes: &[u8], w: u32, h: u32, id: u32, is_tmux: bool, compress: bool) -> String {
     let bytes: Cow<[u8]> = if compress {
         Cow::Owned(zlib(bytes))
@@ -512,11 +510,7 @@ fn transmit_base64(bytes: &[u8], w: u32, h: u32, id: u32, is_tmux: bool, compres
         write!(data, "{escape}_Gq=2,").unwrap();
 
         if i == 0 {
-            write!(
-                data,
-                "i={id},p={PLACEMENT},a=T,U=1,f=32,{compression}t=d,s={w},v={h},"
-            )
-            .unwrap();
+            write!(data, "i={id},a=T,U=1,f=32,{compression}t=d,s={w},v={h},").unwrap();
         }
 
         // m=0 means over
@@ -904,9 +898,9 @@ mod tests {
             "{params}"
         );
         assert!(
-            params.contains("p=1,"),
-            "the virtual placement is NAMED, so a re-transmission to this id replaces it \
-             rather than piling up a second one: {params}"
+            !params.contains("p="),
+            "the virtual placement is anonymous, not named (Ghostty's own placement-replace \
+             fix, ghostty#13723, makes the workaround unnecessary): {params}"
         );
         assert_eq!(bytes, *img.to_rgba8().as_raw());
     }
